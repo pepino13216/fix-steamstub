@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Make SteamStub-wrapped games playable under SLSsteam on Linux.
+
+Steam refuses wrapped titles with "Application load error 6:0000065432"
+because the SteamStub wrapper only clears when SLSsteam strips it, and
+SLSsteam only strips when the app's Steam launch options carry a
+`--steamless` token. Without the token, SLSsteam deliberately restores
+the wrapped executable at every launch.
+
+This tool applies both halves of the fix for one or more appids:
+
+1. Plant `--steamless` into the app's LaunchOptions inside a dormant user
+   profile's localconfig.vdf, merging with an existing value or block
+   when present. SLSsteam scans every profile; the live client never
+   rewrites a dormant profile's file, so the real game spawn stays stock
+   and the token survives client rewrites.
+2. Pre-strip the executable through SLSsteam's own run-steamless.sh
+   helper (Steamless under Wine), so the first Play is instant instead of
+   paying the Wine and Steamless warm-up at launch.
+
+The tool is idempotent: planting is a no-op when the token is already set
+and an already-stripped executable with a fresh marker is left alone. It
+requires the steamstub-bypass kit (run-steamless.sh plus the
+steamless-bin/ payload) next to this script.
+
+Exit codes: 0 success or nothing to do, 1 a failure, 2 usage error.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import struct
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+RUN_HELPER = SCRIPT_DIR / "run-steamless.sh"
+
+# The roots SLSsteam itself scans (steamstub.cpp::steamlessRequested).
+STEAM_ROOTS = (
+    HOME / ".steam/steam",
+    HOME / ".steam/debian-installation",
+    HOME / ".local/share/Steam",
+)
+
+# Runtime/tool manifests that never carry game stubs.
+TOOL_RE = re.compile(
+    r"proton|steamlinuxruntime|steamworks|steam controller|steamvr|steam audio",
+    re.IGNORECASE,
+)
+
+# The launch option this tool plants, and the bounded token the strip
+# gate matches. SLSsteam accepts the token with an optional extra dash
+# (`-steamless` or `--steamless`).
+STEAMLESS_OPT = "--steamless"
+STEAMLESS_TOKEN = "-steamless"
+
+# Marker written next to a successfully stripped executable.
+MARKER_SUFFIX = ".steamless_done"
+
+# Directory levels below the install root that survey() descends into.
+# scan-all.sh stops at find -maxdepth 4; two deeper here so launch exes
+# in deep trees (install/A/B/C/D/Game.exe) are still found. The walk is
+# directory-listing bound and costs well under a second per library.
+MAX_REL_DEPTH = 5
+
+USAGE = """usage:
+  fix-steamstub <appid> [<appid> ...]      plant token + strip (fix now)
+  fix-steamstub --no-strip <appid> [...]   plant token only
+  fix-steamstub --check <appid> [...]      report state, change nothing
+  fix-steamstub --scan                     list installed apps with wrapped exes
+  fix-steamstub --scan --fix               fix every app found
+
+exit: 0 ok/nothing to do, 1 some failure, 2 usage error"""
+
+
+def log(msg: str) -> None:
+    print(f"[fix-steamstub] {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"[fix-steamstub] WARN: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Steam library discovery
+# ---------------------------------------------------------------------------
+
+
+def steamapps_roots() -> list[Path]:
+    """Return every `<library>/steamapps` directory: the standard roots
+    plus each "path" entry in their libraryfolders.vdf, deduped."""
+    candidates = [root / "steamapps" for root in STEAM_ROOTS]
+    for steamapps in list(candidates):
+        libraryfolders = steamapps / "libraryfolders.vdf"
+        if not libraryfolders.is_file():
+            continue
+        try:
+            text = libraryfolders.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        for match in re.finditer(r'"path"\s*"([^"]+)"', text):
+            candidates.append(Path(match.group(1)) / "steamapps")
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for steamapps in candidates:
+        try:
+            key = steamapps.resolve()
+        except OSError:
+            key = steamapps
+        if key in seen or not steamapps.is_dir():
+            continue
+        seen.add(key)
+        roots.append(steamapps)
+    return roots
+
+
+def all_manifests() -> Iterator[tuple[str, Path]]:
+    """Yield `(appid, manifest_path)` for every installed app."""
+    for steamapps in steamapps_roots():
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+            match = re.fullmatch(r"appmanifest_(\d+)\.acf", manifest.name)
+            if match:
+                yield match.group(1), manifest
+
+
+def _acf_field(text: str, key: str) -> str | None:
+    match = re.search(rf'"{key}"\s*"([^"]*)"', text)
+    return match.group(1) if match else None
+
+
+def resolve_install_dir(appid: str) -> tuple[Path, str] | None:
+    """Return `(install_dir, display_name)` for the first library that
+    holds both the app's manifest and the install directory."""
+    for steamapps in steamapps_roots():
+        manifest = steamapps / f"appmanifest_{appid}.acf"
+        if not manifest.is_file():
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        installdir = _acf_field(text, "installdir")
+        name = _acf_field(text, "name") or appid
+        if not installdir:
+            continue
+        install_dir = steamapps / "common" / installdir
+        if install_dir.is_dir():
+            return install_dir, name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# SteamStub probe (same detection as run-steamless.sh)
+# ---------------------------------------------------------------------------
+
+
+def stub_kind(path: Path) -> str:
+    """Return 'v2' (VLV magic at 0x40), 'v3' (.bind section) or 'none'."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return "none"
+    if head[0x40:0x44] == b"VLV\x00":
+        return "v2"
+    if head[:2] != b"MZ":
+        return "none"
+    try:
+        e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+        if e_lfanew + 0x18 > len(head):
+            return "none"
+        if head[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+            return "none"
+        nsec = struct.unpack_from("<H", head, e_lfanew + 6)[0]
+        optsize = struct.unpack_from("<H", head, e_lfanew + 0x14)[0]
+        sec_off = e_lfanew + 0x18 + optsize
+        if sec_off + nsec * 40 > len(head):
+            with open(path, "rb") as handle:
+                head = handle.read(sec_off + nsec * 40 + 16)
+        for index in range(nsec):
+            section = head[sec_off + index * 40 : sec_off + index * 40 + 8]
+            if section.rstrip(b"\x00") == b".bind":
+                return "v3"
+    except (struct.error, OSError):
+        pass
+    return "none"
+
+
+def survey(install_dir: Path) -> tuple[list[tuple[Path, str]], list[Path]]:
+    """Walk the install tree once, capped at MAX_REL_DEPTH levels.
+
+    Returns `(wrapped, markers)`:
+
+    * `wrapped`: `[(exe_path, kind)]` for stub-carrying executables,
+      excluding Steamless artefacts (*.original.exe, *.unpacked.exe)
+    * `markers`: paths of `.steamless_done` files (executable inferred)
+    """
+    base = len(install_dir.parts)
+    wrapped: list[tuple[Path, str]] = []
+    markers: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(install_dir):
+        if len(Path(dirpath).parts) - base >= MAX_REL_DEPTH:
+            dirnames[:] = []
+        for filename in filenames:
+            lower = filename.lower()
+            if lower.endswith(MARKER_SUFFIX):
+                markers.append(Path(dirpath) / filename)
+            elif lower.endswith(".exe") and not lower.endswith(
+                (".original.exe", ".unpacked.exe")
+            ):
+                path = Path(dirpath) / filename
+                kind = stub_kind(path)
+                if kind != "none":
+                    wrapped.append((path, kind))
+    return wrapped, markers
+
+
+def marker_exe(marker: Path) -> Path:
+    """The executable a `.steamless_done` marker belongs to."""
+    return Path(str(marker)[: -len(MARKER_SUFFIX)])
+
+
+def marker_fresh(marker: Path) -> bool:
+    """True when the marker is newer than its executable, i.e. the strip
+    is up to date. A Steam update re-writes the exe and stales it."""
+    exe = marker_exe(marker)
+    try:
+        return exe.is_file() and marker.stat().st_mtime > exe.stat().st_mtime
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# VDF / LaunchOptions (mirrors steamstub_launchopt.hpp)
+# ---------------------------------------------------------------------------
+
+
+def locate_app_block(text: str, appid: str) -> tuple[int, int] | None:
+    """Find the depth-1 `"<appid>"` child of the first "apps" section.
+
+    Returns `(key_pos, block_open)` or None. Mirrors the walk in
+    parseAppLaunchOptions(): the first `"apps"` occurrence, then the
+    first matching appid key at depth 1 within that section.
+    """
+    apps = text.find('"apps"')
+    if apps < 0:
+        return None
+    apps_open = text.find("{", apps + len('"apps"'))
+    if apps_open < 0:
+        return None
+
+    needle = f'"{appid}"'
+    pos = apps_open + 1
+    depth = 1
+    while pos < len(text) and depth >= 1:
+        char = text[pos]
+        if char == "{":
+            depth += 1
+            pos += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return None
+            pos += 1
+            continue
+        if char == '"' and depth == 1 and text.startswith(needle, pos):
+            block_open = text.find("{", pos + len(needle))
+            if block_open < 0:
+                return None
+            return pos, block_open
+        pos += 1
+    return None
+
+
+def find_launch_options_span(text: str, block_open: int) -> tuple[int, int] | None:
+    """Find the first `"LaunchOptions"` value inside an appid block.
+
+    Returns `(value_start, value_end)`, the indexes of the value's
+    opening and closing quotes, or None. Mirrors the walk in
+    parseAppLaunchOptions().
+    """
+    key = '"LaunchOptions"'
+    pos = block_open + 1
+    depth = 1
+    while pos < len(text) and depth >= 1:
+        char = text[pos]
+        if char == "{":
+            depth += 1
+            pos += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return None
+            pos += 1
+            continue
+        if char == '"' and text.startswith(key, pos):
+            start = text.find('"', pos + len(key))
+            if start < 0:
+                return None
+            index = start + 1
+            while index < len(text):
+                char = text[index]
+                if char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                if char == '"':
+                    return start, index
+                index += 1
+            return None
+        pos += 1
+    return None
+
+
+def unescape_vdf(raw: str) -> str:
+    """Undo VDF backslash escapes in a quoted value."""
+    if "\\" not in raw:
+        return raw
+    out: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\" and index + 1 < len(raw):
+            index += 1
+            out.append(raw[index])
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def parse_launch_options(text: str, appid: str) -> str | None:
+    """Return the appid's LaunchOptions value from the first "apps"
+    section, or None. Same result as SLSsteam's parseAppLaunchOptions()."""
+    block = locate_app_block(text, appid)
+    if block is None:
+        return None
+    _, block_open = block
+    span = find_launch_options_span(text, block_open)
+    if span is None:
+        return None
+    start, end = span
+    return unescape_vdf(text[start + 1 : end])
+
+
+def requests_steamless(opts: str | None) -> bool:
+    """True when `opts` carries a bounded `-steamless` token.
+
+    Mirrors requestsSteamless(): the token must start at position 0 or
+    after space/tab/'-' and end at end-of-string or before space/tab.
+    Accepts both `-steamless` and `--steamless`; rejects
+    `/opt/no-steamlessness`.
+    """
+    if opts is None:
+        return False
+    token = STEAMLESS_TOKEN
+    pos = 0
+    while True:
+        pos = opts.find(token, pos)
+        if pos < 0:
+            return False
+        left_ok = pos == 0 or opts[pos - 1] in " \t-"
+        end = pos + len(token)
+        right_ok = end == len(opts) or opts[end] in " \t"
+        if left_ok and right_ok:
+            return True
+        pos = end
+
+
+def ensure_token(text: str, appid: str) -> tuple[str, str | None]:
+    """Splice the `--steamless` token for `appid` into the first "apps"
+    section, least-invasively:
+
+    * existing LaunchOptions value  -> append the token to it
+    * existing appid block, no key  -> add "LaunchOptions" inside the block
+    * no appid block                -> add a new depth-1 block
+    * no "apps" section             -> graft the whole section
+
+    Returns `(new_text, how)`; `(text, None)` when the token is already
+    set.
+    """
+    block = locate_app_block(text, appid)
+    if block is not None:
+        key_pos, block_open = block
+        span = find_launch_options_span(text, block_open)
+        if span is not None:
+            start, end = span
+            raw = text[start + 1 : end]
+            if requests_steamless(unescape_vdf(raw)):
+                return text, None
+            separator = " " if raw else ""
+            new = text[:end] + separator + STEAMLESS_OPT + text[end:]
+            return new, "appended to existing LaunchOptions"
+        # The block exists but has no LaunchOptions key; add one.
+        line_start = text.rfind("\n", 0, key_pos) + 1
+        inner = text[line_start:key_pos] + "\t"
+        key_line = f'\n{inner}"LaunchOptions"\t\t"{STEAMLESS_OPT}"'
+        return (
+            text[: block_open + 1] + key_line + text[block_open + 1 :],
+            "added LaunchOptions to existing appid block",
+        )
+
+    apps = text.find('"apps"')
+    if apps >= 0:
+        apps_open = text.find("{", apps + len('"apps"'))
+        if apps_open < 0:
+            raise ValueError('"apps" key without a block')
+        line_start = text.rfind("\n", 0, apps) + 1
+        block_indent = text[line_start:apps]
+        key_indent = block_indent + "\t"
+        inner_indent = key_indent + "\t"
+        new_block = (
+            f'\n{key_indent}"{appid}"\n{key_indent}{{\n'
+            f'{inner_indent}"LaunchOptions"\t\t"{STEAMLESS_OPT}"\n'
+            f"{key_indent}}}"
+        )
+        return (
+            text[: apps_open + 1] + new_block + text[apps_open + 1 :],
+            "new appid block",
+        )
+
+    # Fresh profile without an "apps" section; graft one under the root.
+    root_open = text.find("{")
+    if root_open < 0:
+        raise ValueError("no VDF root block")
+    new_block = (
+        '\n\t"apps"\n\t{\n'
+        f'\t\t"{appid}"\n\t\t{{\n'
+        f'\t\t\t"LaunchOptions"\t\t"{STEAMLESS_OPT}"\n'
+        "\t\t}\n\t}"
+    )
+    return (
+        text[: root_open + 1] + new_block + text[root_open + 1 :],
+        "grafted apps section",
+    )
+
+
+# ---------------------------------------------------------------------------
+# User profile selection
+# ---------------------------------------------------------------------------
+
+
+def userdata_localconfigs() -> list[Path]:
+    """Every localconfig.vdf SLSsteam would scan, deduped by real path."""
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for root in STEAM_ROOTS:
+        userdata = root / "userdata"
+        if not userdata.is_dir():
+            continue
+        for child in sorted(userdata.iterdir()):
+            if not child.is_dir():
+                continue
+            vdf = child / "config" / "localconfig.vdf"
+            if not vdf.is_file():
+                continue
+            try:
+                key = vdf.resolve()
+            except OSError:
+                key = vdf
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(vdf)
+    return out
+
+
+def token_state(appid: str) -> tuple[Path | None, str | None]:
+    """Return `(localconfig_path, opts)` for the first profile whose
+    parsed LaunchOptions carry the token, else `(None, None)`."""
+    for vdf in userdata_localconfigs():
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        opts = parse_launch_options(text, appid)
+        if requests_steamless(opts):
+            return vdf, opts
+    return None, None
+
+
+def pick_plant_target() -> tuple[Path | None, str]:
+    """Choose the profile to plant into.
+
+    SLSsteam scans every profile, so the only concern is durability: the
+    oldest localconfig by mtime is a dormant profile the live client
+    will not rewrite. Returns `(path, reason)`.
+    """
+    files = userdata_localconfigs()
+    if not files:
+        return None, "no localconfig.vdf found under any userdata dir"
+    if len(files) == 1:
+        return files[0], "only one profile present"
+    files = sorted(files, key=lambda path: path.stat().st_mtime)
+    return files[0], "oldest profile (dormant, live client won't rewrite it)"
+
+
+def steam_client_running() -> bool:
+    """True when a process named `steam` exists. Probed via /proc so the
+    check adds no dependencies."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", "r") as handle:
+                if handle.read().strip() == "steam":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+
+def action_plant(appid: str) -> bool:
+    """Ensure the `--steamless` token exists for the appid somewhere
+    SLSsteam reads. Idempotent; True when the token is in place."""
+    holder, _ = token_state(appid)
+    if holder is not None:
+        log(f"appid {appid}: --steamless already set in {holder}")
+        return True
+
+    target, reason = pick_plant_target()
+    if target is None:
+        warn(f"appid {appid}: cannot plant token: {reason}")
+        return False
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as error:
+        warn(f"appid {appid}: cannot read {target}: {error}")
+        return False
+
+    try:
+        new, how = ensure_token(text, appid)
+    except ValueError as error:
+        warn(f"appid {appid}: {target}: {error}")
+        return False
+    if how is None:
+        # Set on disk between the token_state probe and this read.
+        log(f"appid {appid}: --steamless already set in {target}")
+        return True
+
+    # Verify with the same semantics the injected library uses before
+    # committing anything, then replace atomically next to the original.
+    check = parse_launch_options(new, appid)
+    if not requests_steamless(check):
+        warn(f"appid {appid}: internal verification failed; {target} left untouched")
+        return False
+
+    backup = target.with_name(target.name + ".pre-fixsteamstub.bak")
+    try:
+        if not backup.exists():
+            backup.write_bytes(target.read_bytes())
+        temp = target.with_name(target.name + ".fixsteamstub.tmp")
+        temp.write_text(new, encoding="utf-8", errors="surrogateescape")
+        os.replace(temp, target)
+    except OSError as error:
+        warn(f"appid {appid}: write to {target} failed: {error}")
+        return False
+
+    log(f"appid {appid}: planted --steamless in {target} ({how}; {reason})")
+    if len(userdata_localconfigs()) == 1:
+        if steam_client_running():
+            warn(
+                f"appid {appid}: Steam client is running and this is the only "
+                f"profile; if the token vanishes later, rerun with Steam closed"
+            )
+        else:
+            log(
+                f"appid {appid}: note: only one profile; if the token ever "
+                f"vanishes, rerun while Steam is closed"
+            )
+    return True
+
+
+def strip_exe(exe: Path, kind: str, quiet: bool = False) -> bool:
+    """Run SLSsteam's pre-strip helper on one executable. True on success
+    or benign no-op, False on real failure."""
+    if not RUN_HELPER.is_file():
+        warn(f"strip helper missing: {RUN_HELPER}")
+        return False
+    log(f"stripping {exe.name} (SteamStub {kind}) via run-steamless.sh")
+    env = dict(os.environ)
+    if quiet:
+        env["QUIET"] = "1"
+    result = subprocess.run(
+        ["bash", str(RUN_HELPER), str(exe)],
+        env=env,
+        stdout=subprocess.DEVNULL if quiet else None,
+        check=False,
+    )
+
+    if result.returncode == 0:
+        after = stub_kind(exe)
+        backup = Path(str(exe) + ".original.exe")
+        fresh = marker_fresh(Path(str(exe) + MARKER_SUFFIX))
+        if after == "none" and backup.is_file() and fresh:
+            log(f"unpacked: {exe.name} (original kept at {backup.name})")
+            return True
+        warn(
+            f"{exe.name}: helper exited 0 but post-state looks wrong "
+            f"(stub={after}, backup={backup.is_file()})"
+        )
+        return False
+    if result.returncode == 2:
+        log(f"{exe.name}: not wrapped anymore; nothing to strip")
+        return True
+    warn(
+        f"{exe.name}: run-steamless.sh failed (rc={result.returncode}); "
+        f"see helper output above for the cause"
+    )
+    return False
+
+
+def fix_app(appid: str, do_strip: bool = True, quiet: bool = False) -> bool:
+    """Full fix for one appid: plant the token first, then strip."""
+    install = resolve_install_dir(appid)
+    if install is None:
+        warn(f"appid {appid}: not installed in any Steam library")
+        return False
+    install_dir, name = install
+
+    ok = action_plant(appid)
+
+    wrapped, _ = survey(install_dir)
+    if do_strip:
+        if not wrapped:
+            log(
+                f"appid {appid}: no wrapped exe under {name}; the token is "
+                f"already enough (game stripped or never wrapped)"
+            )
+        for exe, kind in wrapped:
+            ok = strip_exe(exe, kind, quiet=quiet) and ok
+    elif wrapped:
+        log(
+            f"appid {appid}: token planted; {len(wrapped)} wrapped exe(s) "
+            f"left for SLSsteam's launch-time strip (--no-strip)"
+        )
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Reporting modes
+# ---------------------------------------------------------------------------
+
+
+def check_app(appid: str) -> int:
+    """Print the current state for one appid; 0 when ready, 1 otherwise."""
+    holder, opts = token_state(appid)
+    install = resolve_install_dir(appid)
+    name = install[1] if install else "not installed"
+    print(f"appid {appid}  ({name})")
+
+    if holder is None:
+        print("  token:   NOT SET (SLSsteam restores the wrapped exe at launch)")
+    else:
+        print(f"  token:   set in {holder}  [{opts!r}]")
+
+    if install is None:
+        print("  install: not found in any library")
+        return 1
+    install_dir, _ = install
+    wrapped, markers = survey(install_dir)
+
+    if wrapped:
+        for exe, kind in wrapped:
+            relative = exe.relative_to(install_dir)
+            print(f"  wrapped: {relative}  (SteamStub {kind})")
+    else:
+        print("  wrapped: none")
+
+    for marker in markers:
+        exe = marker_exe(marker)
+        if not exe.is_file():
+            continue
+        state = "fresh" if marker_fresh(marker) else "STALE (exe newer, will reprocess)"
+        print(f"  stripped: {exe.relative_to(install_dir)}  marker {state}")
+
+    if holder is None:
+        print(f"  status:  NOT ready (run: fix-steamstub {appid})")
+        return 1
+    if wrapped:
+        print("  status:  ready (SLSsteam strips the wrapped exe at launch)")
+    else:
+        print("  status:  ready to launch")
+    return 0
+
+
+def scan(fix: bool = False, do_strip: bool = True) -> bool:
+    """Survey every installed app; optionally fix all that need it."""
+    found: list[tuple[str, str, list, list]] = []
+    for appid, manifest in all_manifests():
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        name = _acf_field(text, "name") or appid
+        if TOOL_RE.search(name):
+            continue
+        installdir = _acf_field(text, "installdir")
+        if not installdir:
+            continue
+        install_dir = manifest.parent / "common" / installdir
+        if not install_dir.is_dir():
+            continue
+        wrapped, markers = survey(install_dir)
+        if wrapped or markers:
+            found.append((appid, name, wrapped, markers))
+
+    if not found:
+        log("scan: no installed app carries a wrapped or stripped exe")
+        return True
+
+    # Split into work that still matters and work already done. A game is
+    # only "done" when its exe is stripped AND the token is set; a
+    # tokenless stripped exe would be restored at the next launch.
+    needs_fix: list[tuple[str, str, list, bool]] = []
+    already: list[tuple[str, str]] = []
+    for appid, name, wrapped, markers in found:
+        token_ok = token_state(appid)[0] is not None
+        if wrapped or not token_ok:
+            needs_fix.append((appid, name, wrapped, token_ok))
+        else:
+            already.append((appid, name))
+
+    if already:
+        names = ", ".join(f"{appid} ({name})" for appid, name in already)
+        log(f"already stripped + token set ({len(already)}): {names}")
+    for appid, name, wrapped, token_ok in needs_fix:
+        if wrapped:
+            detail = "wrapped: " + ", ".join(exe.name for exe, _ in wrapped)
+        else:
+            detail = "stripped but token missing (would be restored at launch)"
+        state = "token ok" if token_ok else "token missing"
+        log(f"needs fix: appid {appid}  {name}  [{detail}] ({state})")
+
+    if not fix:
+        if needs_fix:
+            log("scan only; rerun with --fix to plant tokens and strip")
+        return True
+
+    ok = True
+    for appid, name, _, _ in needs_fix:
+        log(f"fixing appid {appid}  {name}")
+        ok = fix_app(appid, do_strip=do_strip, quiet=True) and ok
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if not args:
+        print(USAGE)
+        return 2
+    if "-h" in args or "--help" in args:
+        print(USAGE)
+        return 0
+
+    known = {"--scan", "--fix", "--check", "--no-strip"}
+    unknown = [arg for arg in args if arg.startswith("-") and arg not in known]
+    if unknown:
+        warn(f"unknown flag(s): {' '.join(unknown)}")
+        print(USAGE)
+        return 2
+
+    scan_mode = "--scan" in args
+    check_mode = "--check" in args
+    do_strip = "--no-strip" not in args
+    appids = [arg for arg in args if not arg.startswith("-")]
+
+    for appid in appids:
+        if not appid.isdigit():
+            warn(f"appid must be numeric: {appid!r}")
+            return 2
+
+    if scan_mode:
+        if appids:
+            warn("appids ignored in --scan mode")
+        return 0 if scan(fix="--fix" in args, do_strip=do_strip) else 1
+
+    if check_mode:
+        if not appids:
+            print(USAGE)
+            return 2
+        status = 0
+        for appid in appids:
+            status = max(status, check_app(appid))
+        return status
+
+    if not appids:
+        print(USAGE)
+        return 2
+
+    ok = True
+    for appid in appids:
+        ok = fix_app(appid, do_strip=do_strip) and ok
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)

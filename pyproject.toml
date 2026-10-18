@@ -1,0 +1,6 @@
+# Lint/format configuration for fix-steamstub.
+#   ruff check fix-steamstub
+#   ruff format fix-steamstub
+
+[tool.ruff]
+line-length = 88
